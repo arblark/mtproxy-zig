@@ -112,109 +112,45 @@ section "Установка системных зависимостей"
 
 export DEBIAN_FRONTEND=noninteractive
 
-# Ожидание освобождения dpkg lock (другой apt может ещё работать)
+# Агрессивная очистка apt/dpkg lock-ов на свежем VPS
+info "Подготовка пакетного менеджера..."
+
+# 1. Убить все автоматические apt-процессы
+systemctl stop unattended-upgrades.service 2>/dev/null || true
+systemctl disable unattended-upgrades.service 2>/dev/null || true
+systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+pkill -9 -f unattended-upgr 2>/dev/null || true
+pkill -9 -f 'apt\.(get|daily)' 2>/dev/null || true
+pkill -9 -f dpkg 2>/dev/null || true
+sleep 2
+
+# 2. Снять все lock-файлы
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+      /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+
+# 3. Починить dpkg
+dpkg --configure -a --force-confdef --force-confold 2>/dev/null || true
+apt-get -f install -y 2>/dev/null || true
+ok "Пакетный менеджер готов"
+
+# Функция ожидания для повторного использования
 wait_for_apt() {
-    local max_wait=120
-    local waited=0
-
-    # Убить unattended-upgrades если запущен — он может держать lock минутами
-    if pgrep -x unattended-upgr &>/dev/null; then
-        info "Останавливаем unattended-upgrades..."
-        systemctl stop unattended-upgrades.service 2>/dev/null || true
-        systemctl disable unattended-upgrades.service 2>/dev/null || true
-        sleep 2
-        # Если всё ещё висит — убить
-        pkill -9 -x unattended-upgr 2>/dev/null || true
-        pkill -9 -f 'apt-get.*upgrade' 2>/dev/null || true
-    fi
-
-    # Проверяем lock файлы
-    local lock_files=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
-    local locked=false
-
-    for lf in "${lock_files[@]}"; do
-        if [[ -f "$lf" ]] && fuser "$lf" &>/dev/null; then
-            locked=true
+    local i=0
+    while [[ -f /var/lib/dpkg/lock-frontend ]] && lsof /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; do
+        [[ $i -eq 0 ]] && info "Ожидание apt..."
+        sleep 3
+        i=$((i + 3))
+        if [[ $i -ge 60 ]]; then
+            pkill -9 -f apt 2>/dev/null || true
+            pkill -9 -f dpkg 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
             break
         fi
     done
-
-    if $locked; then
-        info "Ожидание завершения другого apt/dpkg процесса..."
-    fi
-
-    while $locked; do
-        sleep 5
-        waited=$((waited + 5))
-        echo -ne "\r  ... ожидание ${waited}с / ${max_wait}с"
-
-        if [[ $waited -ge $max_wait ]]; then
-            echo ""
-            warn "Ожидание dpkg lock превысило ${max_wait}с — принудительное снятие"
-            for lf in "${lock_files[@]}"; do
-                local pid
-                pid=$(fuser "$lf" 2>/dev/null | tr -d ' ')
-                [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
-            done
-            rm -f "${lock_files[@]}"
-            dpkg --configure -a 2>/dev/null || true
-            break
-        fi
-
-        locked=false
-        for lf in "${lock_files[@]}"; do
-            if [[ -f "$lf" ]] && fuser "$lf" &>/dev/null; then
-                locked=true
-                break
-            fi
-        done
-    done
-
-    [[ $waited -gt 0 ]] && echo "" && ok "dpkg lock свободен (ожидали ${waited}с)"
 }
-
-wait_for_apt
-
-# Освободить /boot если он забит старыми ядрами (частая проблема на VPS —
-# initramfs-tools падает с "No space left on device" и ломает весь dpkg)
-clean_boot() {
-    local boot_avail
-    boot_avail=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
-    if [[ -n "$boot_avail" ]] && [[ "$boot_avail" -lt 100 ]]; then
-        info "/boot почти заполнен (${boot_avail}M свободно) — удаляем старые ядра..."
-        local current_kernel
-        current_kernel=$(uname -r)
-        dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | \
-            grep -v "$current_kernel" | grep -v 'linux-image-generic' | \
-            while read -r pkg; do
-                info "Удаление $pkg..."
-                apt-get remove -y --purge "$pkg" 2>/dev/null || dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
-            done
-        # Почистить кеш initramfs
-        rm -f /boot/initrd.img-*-generic.old 2>/dev/null || true
-        apt-get autoremove -y 2>/dev/null || true
-        local boot_after
-        boot_after=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
-        ok "/boot очищен: ${boot_avail}M → ${boot_after}M свободно"
-    fi
-}
-
-# Починить сломанные/незавершённые пакеты (частая проблема на свежих VPS
-# после прерванного unattended-upgrades или apt-daily)
-fix_dpkg() {
-    clean_boot
-    if dpkg --audit 2>/dev/null | grep -q . || \
-       dpkg -l 2>/dev/null | grep -qE '^(iF|iU|rc)'; then
-        info "Обнаружены сломанные/незавершённые пакеты, исправляем..."
-        systemctl mask nginx.service 2>/dev/null || true
-        dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -5 || true
-        apt-get -f install -y 2>&1 | tail -5 || true
-        systemctl unmask nginx.service 2>/dev/null || true
-        ok "dpkg исправлен"
-    fi
-}
-
-fix_dpkg
 
 info "Обновление пакетных списков..."
 apt-get update -qq 2>&1 | tail -1 || true
