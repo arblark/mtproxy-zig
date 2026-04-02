@@ -135,13 +135,37 @@ wait_for_apt() {
 
 wait_for_apt
 
+# Освободить /boot если он забит старыми ядрами (частая проблема на VPS —
+# initramfs-tools падает с "No space left on device" и ломает весь dpkg)
+clean_boot() {
+    local boot_avail
+    boot_avail=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
+    if [[ -n "$boot_avail" ]] && [[ "$boot_avail" -lt 100 ]]; then
+        info "/boot почти заполнен (${boot_avail}M свободно) — удаляем старые ядра..."
+        local current_kernel
+        current_kernel=$(uname -r)
+        dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | \
+            grep -v "$current_kernel" | grep -v 'linux-image-generic' | \
+            while read -r pkg; do
+                info "Удаление $pkg..."
+                apt-get remove -y --purge "$pkg" 2>/dev/null || dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+            done
+        # Почистить кеш initramfs
+        rm -f /boot/initrd.img-*-generic.old 2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+        local boot_after
+        boot_after=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
+        ok "/boot очищен: ${boot_avail}M → ${boot_after}M свободно"
+    fi
+}
+
 # Починить сломанные/незавершённые пакеты (частая проблема на свежих VPS
 # после прерванного unattended-upgrades или apt-daily)
 fix_dpkg() {
+    clean_boot
     if dpkg --audit 2>/dev/null | grep -q . || \
        dpkg -l 2>/dev/null | grep -qE '^(iF|iU|rc)'; then
         info "Обнаружены сломанные/незавершённые пакеты, исправляем..."
-        # Маскируем сервисы чтобы dpkg configure не падал на их запуске
         systemctl mask nginx.service 2>/dev/null || true
         dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -5 || true
         apt-get -f install -y 2>&1 | tail -5 || true
