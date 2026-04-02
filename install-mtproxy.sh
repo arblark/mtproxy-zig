@@ -114,36 +114,72 @@ info "Обновление пакетных списков..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq 2>&1 | tail -1 || true
 
-info "Установка пакетов (это может занять пару минут)..."
-PACKAGES=(
-    git curl wget openssl jq
-    build-essential libnetfilter-queue-dev libcap-dev
-    iptables libmnl-dev zlib1g-dev
-    nginx certbot python3-certbot-nginx
-)
-
-# xxd может быть частью vim-common или xxd (зависит от версии ОС)
-if ! command -v xxd &>/dev/null; then
-    PACKAGES+=(xxd)
+# Починить сломанный dpkg (например, nginx не стартует и блокирует всё)
+if dpkg --audit 2>/dev/null | grep -q .; then
+    info "Обнаружены незавершённые пакеты, исправляем..."
+    # Отключить IPv6 в nginx если он ломает конфигурацию
+    if [[ -f /etc/nginx/sites-enabled/default ]]; then
+        sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/sites-enabled/default 2>/dev/null || true
+    fi
+    if [[ -f /etc/nginx/conf.d/default.conf ]]; then
+        sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/conf.d/default.conf 2>/dev/null || true
+    fi
+    # Отключить автозапуск nginx во время dpkg configure
+    systemctl mask nginx.service 2>/dev/null || true
+    dpkg --configure -a 2>/dev/null || true
+    systemctl unmask nginx.service 2>/dev/null || true
+    ok "dpkg исправлен"
 fi
 
-if ! apt-get install -y "${PACKAGES[@]}" 2>&1 | tail -5; then
-    warn "Некоторые пакеты могли не установиться, пробуем по одному..."
-    for pkg in "${PACKAGES[@]}"; do
-        apt-get install -y "$pkg" 2>/dev/null || warn "Пакет $pkg недоступен — пропуск"
+info "Установка пакетов (это может занять пару минут)..."
+
+# Сначала базовые пакеты без nginx (чтобы nginx не ломал остальное)
+BASE_PACKAGES=(git curl wget openssl jq build-essential iptables
+    libnetfilter-queue-dev libcap-dev libmnl-dev zlib1g-dev)
+
+apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -3 || true
+
+# Nginx отдельно — чтобы его сбой не блокировал всё остальное
+info "Установка nginx..."
+
+# Отключить IPv6 в дефолтном конфиге ДО установки/конфигурирования
+mkdir -p /etc/nginx/conf.d
+# Превентивно создать дефолт без IPv6 listen
+mkdir -p /etc/nginx/sites-available
+if [[ -f /etc/nginx/sites-available/default ]]; then
+    sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/sites-available/default 2>/dev/null || true
+fi
+
+# Временно замаскировать nginx чтобы dpkg не пытался его стартовать при установке
+systemctl mask nginx.service 2>/dev/null || true
+apt-get install -y nginx 2>&1 | tail -3 || true
+systemctl unmask nginx.service 2>/dev/null || true
+
+# Теперь пофиксить конфиг nginx: убрать IPv6 listen если IPv6 недоступен
+if ! cat /proc/net/if_inet6 &>/dev/null || [[ ! -s /proc/net/if_inet6 ]]; then
+    info "IPv6 отключён на сервере — патчим конфиг nginx..."
+    find /etc/nginx -name '*.conf' -o -name 'default' 2>/dev/null | while read -r f; do
+        sed -i 's/listen \[::\]:80/# listen [::]:80/' "$f" 2>/dev/null || true
+        sed -i 's/listen \[::\]:443/# listen [::]:443/' "$f" 2>/dev/null || true
     done
+    if [[ -f /etc/nginx/sites-enabled/default ]]; then
+        sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/sites-enabled/default 2>/dev/null || true
+    fi
+fi
+
+# certbot опционален
+apt-get install -y certbot python3-certbot-nginx 2>/dev/null || warn "certbot не установлен — не критично"
+
+# xxd может быть частью vim-common или отдельным пакетом
+if ! command -v xxd &>/dev/null; then
+    apt-get install -y xxd 2>/dev/null || apt-get install -y vim-common 2>/dev/null || true
 fi
 
 # Критические зависимости — без них продолжать нельзя
 for cmd in git curl openssl; do
     command -v "$cmd" &>/dev/null || fail "Критическая зависимость не установлена: $cmd"
 done
-
-# xxd может быть из vim-common
-if ! command -v xxd &>/dev/null; then
-    apt-get install -y vim-common 2>/dev/null || true
-    command -v xxd &>/dev/null || fail "xxd не удалось установить (нужен для генерации ссылки)"
-fi
+command -v xxd &>/dev/null || fail "xxd не удалось установить (нужен для генерации ссылки)"
 
 ok "Все зависимости установлены"
 
@@ -394,7 +430,14 @@ NGINXEOF
 ln -sf /etc/nginx/sites-available/mtproto-masking /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 
-if nginx -t 2>/dev/null; then
+# Патч: отключить IPv6 listen во всех конфигах nginx если IPv6 недоступен
+if ! cat /proc/net/if_inet6 &>/dev/null || [[ ! -s /proc/net/if_inet6 ]]; then
+    find /etc/nginx -type f \( -name '*.conf' -o -name 'default' \) 2>/dev/null | while read -r f; do
+        sed -i 's/^\(\s*\)listen \[::\]/\1# listen [::]/' "$f" 2>/dev/null || true
+    done
+fi
+
+if nginx -t 2>&1; then
     systemctl enable nginx > /dev/null 2>&1
     systemctl reload nginx 2>/dev/null || systemctl restart nginx
     sleep 1
