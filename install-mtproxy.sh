@@ -131,10 +131,40 @@ sleep 2
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
       /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
 
-# 3. Починить dpkg
-dpkg --configure -a --force-confdef --force-confold 2>/dev/null || true
-apt-get -f install -y 2>/dev/null || true
+# 3. Освободить /boot от старых ядер (иначе dpkg --configure зависнет на initramfs)
+BOOT_AVAIL=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
+if [[ -n "$BOOT_AVAIL" ]] && [[ "$BOOT_AVAIL" -lt 100 ]]; then
+    info "/boot почти заполнен (${BOOT_AVAIL}M) — удаляем старые ядра..."
+    CURRENT_KERNEL=$(uname -r)
+    dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | \
+        grep -v "$CURRENT_KERNEL" | grep -v 'linux-image-generic' | \
+        while read -r pkg; do
+            dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+        done
+    dpkg -l 'linux-modules-*' 2>/dev/null | awk '/^ii/{print $2}' | \
+        grep -v "$CURRENT_KERNEL" | \
+        while read -r pkg; do
+            dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+        done
+    rm -f /boot/initrd.img-*.old 2>/dev/null || true
+    apt-get autoremove -y --purge 2>/dev/null || true
+    BOOT_AFTER=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
+    ok "/boot: ${BOOT_AVAIL}M → ${BOOT_AFTER}M свободно"
+fi
+
+# 4. Починить dpkg
+dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -3 || true
+apt-get -f install -y 2>&1 | tail -3 || true
 ok "Пакетный менеджер готов"
+
+# Функция починки для повторного использования
+fix_dpkg() {
+    pkill -9 -f apt 2>/dev/null || true
+    pkill -9 -f dpkg 2>/dev/null || true
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
+    dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -3 || true
+    apt-get -f install -y 2>&1 | tail -3 || true
+}
 
 # Функция ожидания для повторного использования
 wait_for_apt() {
