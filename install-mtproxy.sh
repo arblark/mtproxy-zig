@@ -135,25 +135,25 @@ wait_for_apt() {
 
 wait_for_apt
 
+# Починить сломанные/незавершённые пакеты (частая проблема на свежих VPS
+# после прерванного unattended-upgrades или apt-daily)
+fix_dpkg() {
+    if dpkg --audit 2>/dev/null | grep -q . || \
+       dpkg -l 2>/dev/null | grep -qE '^(iF|iU|rc)'; then
+        info "Обнаружены сломанные/незавершённые пакеты, исправляем..."
+        # Маскируем сервисы чтобы dpkg configure не падал на их запуске
+        systemctl mask nginx.service 2>/dev/null || true
+        dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -5 || true
+        apt-get -f install -y 2>&1 | tail -5 || true
+        systemctl unmask nginx.service 2>/dev/null || true
+        ok "dpkg исправлен"
+    fi
+}
+
+fix_dpkg
+
 info "Обновление пакетных списков..."
 apt-get update -qq 2>&1 | tail -1 || true
-
-# Починить сломанный dpkg (например, nginx не стартует и блокирует всё)
-if dpkg --audit 2>/dev/null | grep -q .; then
-    info "Обнаружены незавершённые пакеты, исправляем..."
-    # Отключить IPv6 в nginx если он ломает конфигурацию
-    if [[ -f /etc/nginx/sites-enabled/default ]]; then
-        sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/sites-enabled/default 2>/dev/null || true
-    fi
-    if [[ -f /etc/nginx/conf.d/default.conf ]]; then
-        sed -i 's/listen \[::\]:80/# listen [::]:80/' /etc/nginx/conf.d/default.conf 2>/dev/null || true
-    fi
-    # Отключить автозапуск nginx во время dpkg configure
-    systemctl mask nginx.service 2>/dev/null || true
-    dpkg --configure -a 2>/dev/null || true
-    systemctl unmask nginx.service 2>/dev/null || true
-    ok "dpkg исправлен"
-fi
 
 info "Установка пакетов (это может занять пару минут)..."
 
@@ -161,7 +161,11 @@ info "Установка пакетов (это может занять пару
 BASE_PACKAGES=(git curl wget openssl jq build-essential iptables
     libnetfilter-queue-dev libcap-dev libmnl-dev zlib1g-dev)
 
-apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -3 || true
+if ! apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -5; then
+    warn "Ошибка при массовой установке — пробуем починить dpkg и повторить..."
+    fix_dpkg
+    apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -3 || true
+fi
 
 # Nginx отдельно — чтобы его сбой не блокировал всё остальное
 info "Установка nginx..."
