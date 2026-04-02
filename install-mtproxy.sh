@@ -116,21 +116,61 @@ export DEBIAN_FRONTEND=noninteractive
 wait_for_apt() {
     local max_wait=120
     local waited=0
-    while fuser /var/lib/dpkg/lock-frontend &>/dev/null || fuser /var/lib/apt/lists/lock &>/dev/null; do
-        if [[ $waited -eq 0 ]]; then
-            info "Ожидание завершения другого apt/dpkg процесса..."
-        fi
-        sleep 5
-        waited=$((waited + 5))
-        if [[ $waited -ge $max_wait ]]; then
-            warn "Ожидание dpkg lock превысило ${max_wait}с — принудительное снятие"
-            kill -9 "$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null)" 2>/dev/null || true
-            rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
-            dpkg --configure -a 2>/dev/null || true
+
+    # Убить unattended-upgrades если запущен — он может держать lock минутами
+    if pgrep -x unattended-upgr &>/dev/null; then
+        info "Останавливаем unattended-upgrades..."
+        systemctl stop unattended-upgrades.service 2>/dev/null || true
+        systemctl disable unattended-upgrades.service 2>/dev/null || true
+        sleep 2
+        # Если всё ещё висит — убить
+        pkill -9 -x unattended-upgr 2>/dev/null || true
+        pkill -9 -f 'apt-get.*upgrade' 2>/dev/null || true
+    fi
+
+    # Проверяем lock файлы
+    local lock_files=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+    local locked=false
+
+    for lf in "${lock_files[@]}"; do
+        if [[ -f "$lf" ]] && fuser "$lf" &>/dev/null; then
+            locked=true
             break
         fi
     done
-    [[ $waited -gt 0 ]] && ok "dpkg lock свободен (ожидали ${waited}с)"
+
+    if $locked; then
+        info "Ожидание завершения другого apt/dpkg процесса..."
+    fi
+
+    while $locked; do
+        sleep 5
+        waited=$((waited + 5))
+        echo -ne "\r  ... ожидание ${waited}с / ${max_wait}с"
+
+        if [[ $waited -ge $max_wait ]]; then
+            echo ""
+            warn "Ожидание dpkg lock превысило ${max_wait}с — принудительное снятие"
+            for lf in "${lock_files[@]}"; do
+                local pid
+                pid=$(fuser "$lf" 2>/dev/null | tr -d ' ')
+                [[ -n "$pid" ]] && kill -9 "$pid" 2>/dev/null || true
+            done
+            rm -f "${lock_files[@]}"
+            dpkg --configure -a 2>/dev/null || true
+            break
+        fi
+
+        locked=false
+        for lf in "${lock_files[@]}"; do
+            if [[ -f "$lf" ]] && fuser "$lf" &>/dev/null; then
+                locked=true
+                break
+            fi
+        done
+    done
+
+    [[ $waited -gt 0 ]] && echo "" && ok "dpkg lock свободен (ожидали ${waited}с)"
 }
 
 wait_for_apt
