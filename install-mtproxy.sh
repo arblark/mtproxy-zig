@@ -53,7 +53,12 @@ RESET='\033[0m'
 
 # ── Логирование ─────────────────────────────────────────────
 LOG_FILE="/var/log/mtproto-install.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+touch "$LOG_FILE"
+
+log_to_file() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+trap 'log_to_file "Script exited with code $?"' EXIT
 
 info()    { echo -e "${CYAN}▸${RESET} $*"; }
 ok()      { echo -e "${GREEN}✓${RESET} $*"; }
@@ -107,15 +112,39 @@ section "Установка системных зависимостей"
 
 info "Обновление пакетных списков..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+apt-get update -qq 2>&1 | tail -1 || true
 
-info "Установка пакетов..."
-apt-get install -y -qq \
-    git curl wget openssl xxd jq \
-    build-essential libnetfilter-queue-dev libcap-dev \
-    iptables libmnl-dev zlib1g-dev \
-    nginx certbot python3-certbot-nginx \
-    > /dev/null 2>&1
+info "Установка пакетов (это может занять пару минут)..."
+PACKAGES=(
+    git curl wget openssl jq
+    build-essential libnetfilter-queue-dev libcap-dev
+    iptables libmnl-dev zlib1g-dev
+    nginx certbot python3-certbot-nginx
+)
+
+# xxd может быть частью vim-common или xxd (зависит от версии ОС)
+if ! command -v xxd &>/dev/null; then
+    PACKAGES+=(xxd)
+fi
+
+if ! apt-get install -y "${PACKAGES[@]}" 2>&1 | tail -5; then
+    warn "Некоторые пакеты могли не установиться, пробуем по одному..."
+    for pkg in "${PACKAGES[@]}"; do
+        apt-get install -y "$pkg" 2>/dev/null || warn "Пакет $pkg недоступен — пропуск"
+    done
+fi
+
+# Критические зависимости — без них продолжать нельзя
+for cmd in git curl openssl; do
+    command -v "$cmd" &>/dev/null || fail "Критическая зависимость не установлена: $cmd"
+done
+
+# xxd может быть из vim-common
+if ! command -v xxd &>/dev/null; then
+    apt-get install -y vim-common 2>/dev/null || true
+    command -v xxd &>/dev/null || fail "xxd не удалось установить (нужен для генерации ссылки)"
+fi
+
 ok "Все зависимости установлены"
 
 # ── Установка Zig ───────────────────────────────────────────
@@ -143,10 +172,11 @@ fi
 section "Сборка MTProto proxy"
 
 TMPBUILD=$(mktemp -d)
-trap "rm -rf $TMPBUILD" EXIT
+cleanup() { rm -rf "$TMPBUILD"; log_to_file "Cleanup done, temp dir removed"; }
+trap cleanup EXIT
 
 info "Клонирование репозитория..."
-git clone --depth 1 "$REPO_URL" "$TMPBUILD" 2>/dev/null
+git clone --depth 1 "$REPO_URL" "$TMPBUILD" || fail "Не удалось клонировать репозиторий"
 cd "$TMPBUILD"
 
 info "Сборка (ReleaseFast)... Это может занять 1-3 минуты."
@@ -306,11 +336,14 @@ if command -v ip6tables &>/dev/null; then
 fi
 
 # ── Сохранение правил iptables при перезагрузке ─────────────
-if ! dpkg -l | grep -q iptables-persistent 2>/dev/null; then
+if ! dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii"; then
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
-    apt-get install -y -qq iptables-persistent > /dev/null 2>&1 || true
-    ok "iptables-persistent установлен (правила сохранятся после ребута)"
+    if apt-get install -y iptables-persistent 2>/dev/null; then
+        ok "iptables-persistent установлен (правила сохранятся после ребута)"
+    else
+        warn "iptables-persistent не удалось установить — правила могут не пережить ребут"
+    fi
 fi
 
 # ── Локальный Nginx (zero-RTT маскировка) ───────────────────
@@ -385,12 +418,16 @@ if [[ -x "${ZAPRET_DIR}/nfq/nfqws" ]]; then
 else
     info "Клонирование zapret..."
     rm -rf "$ZAPRET_DIR"
-    git clone --depth 1 https://github.com/bol-van/zapret.git "$ZAPRET_DIR" 2>/dev/null
+    if ! git clone --depth 1 https://github.com/bol-van/zapret.git "$ZAPRET_DIR"; then
+        warn "Не удалось клонировать zapret — пропускаем TCP desync"
+    fi
 
-    info "Сборка nfqws..."
-    cd "${ZAPRET_DIR}/nfq"
-    make clean > /dev/null 2>&1 || true
-    make > /dev/null 2>&1
+    if [[ -d "${ZAPRET_DIR}/nfq" ]]; then
+        info "Сборка nfqws..."
+        cd "${ZAPRET_DIR}/nfq"
+        make clean > /dev/null 2>&1 || true
+        make 2>&1 | tail -3 || true
+    fi
 
     if [[ -x nfqws ]]; then
         ok "nfqws собран"
