@@ -131,25 +131,19 @@ sleep 2
 rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
       /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
 
-# 3. Освободить /boot от старых ядер (иначе dpkg --configure зависнет на initramfs)
-BOOT_AVAIL=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
-if [[ -n "$BOOT_AVAIL" ]] && [[ "$BOOT_AVAIL" -lt 100 ]]; then
-    info "/boot почти заполнен (${BOOT_AVAIL}M) — удаляем старые ядра..."
-    CURRENT_KERNEL=$(uname -r)
-    dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print $2}' | \
-        grep -v "$CURRENT_KERNEL" | grep -v 'linux-image-generic' | \
-        while read -r pkg; do
-            dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
-        done
-    dpkg -l 'linux-modules-*' 2>/dev/null | awk '/^ii/{print $2}' | \
-        grep -v "$CURRENT_KERNEL" | \
-        while read -r pkg; do
-            dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
-        done
+# 3. Принудительно удалить сломанные пакеты ядра (они блокируют весь dpkg)
+CURRENT_KERNEL=$(uname -r)
+BROKEN_PKGS=$(dpkg -l 'linux-image-*' 'linux-modules-*' 'linux-firmware' 'initramfs-tools' 2>/dev/null | \
+    awk '/^(iF|iU|iW|iHR)/{print $2}' | grep -v "$CURRENT_KERNEL" || true)
+
+if [[ -n "$BROKEN_PKGS" ]]; then
+    info "Удаляем сломанные пакеты ядра, блокирующие dpkg..."
+    for pkg in $BROKEN_PKGS; do
+        info "  → $pkg"
+        dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+    done
     rm -f /boot/initrd.img-*.old 2>/dev/null || true
-    apt-get autoremove -y --purge 2>/dev/null || true
-    BOOT_AFTER=$(df /boot --output=avail -BM 2>/dev/null | tail -1 | tr -d ' M')
-    ok "/boot: ${BOOT_AVAIL}M → ${BOOT_AFTER}M свободно"
+    ok "Сломанные пакеты удалены"
 fi
 
 # 4. Починить dpkg
@@ -162,6 +156,12 @@ fix_dpkg() {
     pkill -9 -f apt 2>/dev/null || true
     pkill -9 -f dpkg 2>/dev/null || true
     rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null || true
+    # Удалить сломанные пакеты ядра если они мешают
+    local broken
+    broken=$(dpkg -l 2>/dev/null | awk '/^(iF|iU|iW)/{print $2}' | grep -E 'linux-|initramfs|firmware' || true)
+    for pkg in $broken; do
+        dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
+    done
     dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -3 || true
     apt-get -f install -y 2>&1 | tail -3 || true
 }
