@@ -110,8 +110,32 @@ ok "CPU: ${CORES} ядер"
 # ── Обновление системы и зависимости ────────────────────────
 section "Установка системных зависимостей"
 
-info "Обновление пакетных списков..."
 export DEBIAN_FRONTEND=noninteractive
+
+# Ожидание освобождения dpkg lock (другой apt может ещё работать)
+wait_for_apt() {
+    local max_wait=120
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend &>/dev/null || fuser /var/lib/apt/lists/lock &>/dev/null; do
+        if [[ $waited -eq 0 ]]; then
+            info "Ожидание завершения другого apt/dpkg процесса..."
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if [[ $waited -ge $max_wait ]]; then
+            warn "Ожидание dpkg lock превысило ${max_wait}с — принудительное снятие"
+            kill -9 "$(fuser /var/lib/dpkg/lock-frontend 2>/dev/null)" 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+            dpkg --configure -a 2>/dev/null || true
+            break
+        fi
+    done
+    [[ $waited -gt 0 ]] && ok "dpkg lock свободен (ожидали ${waited}с)"
+}
+
+wait_for_apt
+
+info "Обновление пакетных списков..."
 apt-get update -qq 2>&1 | tail -1 || true
 
 # Починить сломанный dpkg (например, nginx не стартует и блокирует всё)
@@ -373,6 +397,7 @@ fi
 
 # ── Сохранение правил iptables при перезагрузке ─────────────
 if ! dpkg -l iptables-persistent 2>/dev/null | grep -q "^ii"; then
+    wait_for_apt
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
     if apt-get install -y iptables-persistent 2>/dev/null; then
@@ -386,26 +411,37 @@ fi
 section "Zero-RTT маскировка (Nginx)"
 
 NGINX_PORT=8443
-CERT_DIR="/etc/nginx/ssl"
-mkdir -p "$CERT_DIR"
+NGINX_OK=false
 
-info "Генерация self-signed сертификата для ${TLS_DOMAIN}..."
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "${CERT_DIR}/key.pem" \
-    -out "${CERT_DIR}/cert.pem" \
-    -days 3650 -nodes \
-    -subj "/CN=${TLS_DOMAIN}" \
-    2>/dev/null
-ok "Сертификат создан"
+if ! command -v nginx &>/dev/null; then
+    warn "Nginx не установлен — пробуем ещё раз..."
+    wait_for_apt
+    apt-get install -y nginx 2>&1 | tail -3 || true
+fi
 
-mkdir -p /var/www/masking
-cat > /var/www/masking/index.html << 'HTMLEOF'
+if command -v nginx &>/dev/null; then
+    CERT_DIR="/etc/nginx/ssl"
+    mkdir -p "$CERT_DIR"
+
+    info "Генерация self-signed сертификата для ${TLS_DOMAIN}..."
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "${CERT_DIR}/key.pem" \
+        -out "${CERT_DIR}/cert.pem" \
+        -days 3650 -nodes \
+        -subj "/CN=${TLS_DOMAIN}" \
+        2>/dev/null
+    ok "Сертификат создан"
+
+    mkdir -p /var/www/masking
+    cat > /var/www/masking/index.html << 'HTMLEOF'
 <!DOCTYPE html>
 <html><head><title>Welcome</title></head>
 <body><h1>It works!</h1></body></html>
 HTMLEOF
 
-cat > /etc/nginx/sites-available/mtproto-masking << NGINXEOF
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
+    cat > /etc/nginx/sites-available/mtproto-masking << NGINXEOF
 server {
     listen 127.0.0.1:${NGINX_PORT} ssl;
     server_name ${TLS_DOMAIN};
@@ -427,27 +463,31 @@ server {
 }
 NGINXEOF
 
-ln -sf /etc/nginx/sites-available/mtproto-masking /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/mtproto-masking /etc/nginx/sites-enabled/
+    rm -f /etc/nginx/sites-enabled/default
 
-# Патч: отключить IPv6 listen во всех конфигах nginx если IPv6 недоступен
-if ! cat /proc/net/if_inet6 &>/dev/null || [[ ! -s /proc/net/if_inet6 ]]; then
-    find /etc/nginx -type f \( -name '*.conf' -o -name 'default' \) 2>/dev/null | while read -r f; do
-        sed -i 's/^\(\s*\)listen \[::\]/\1# listen [::]/' "$f" 2>/dev/null || true
-    done
-fi
+    # Патч: отключить IPv6 listen во всех конфигах nginx если IPv6 недоступен
+    if ! cat /proc/net/if_inet6 &>/dev/null || [[ ! -s /proc/net/if_inet6 ]]; then
+        find /etc/nginx -type f \( -name '*.conf' -o -name 'default' \) 2>/dev/null | while read -r f; do
+            sed -i 's/^\(\s*\)listen \[::\]/\1# listen [::]/' "$f" 2>/dev/null || true
+        done
+    fi
 
-if nginx -t 2>&1; then
-    systemctl enable nginx > /dev/null 2>&1
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
-    sleep 1
-    if curl -sk "https://127.0.0.1:${NGINX_PORT}/" > /dev/null 2>&1; then
-        ok "Nginx работает на 127.0.0.1:${NGINX_PORT}"
+    if nginx -t 2>&1; then
+        systemctl enable nginx > /dev/null 2>&1
+        systemctl restart nginx
+        sleep 1
+        if curl -sk "https://127.0.0.1:${NGINX_PORT}/" > /dev/null 2>&1; then
+            ok "Nginx работает на 127.0.0.1:${NGINX_PORT}"
+            NGINX_OK=true
+        else
+            warn "Nginx может ещё не отвечать"
+        fi
     else
-        warn "Nginx может ещё не отвечать"
+        warn "Ошибка конфигурации Nginx — проверьте: nginx -t"
     fi
 else
-    warn "Ошибка конфигурации Nginx"
+    warn "Nginx недоступен — zero-RTT маскировка не настроена"
 fi
 
 # ── Zapret nfqws (TCP desync) ──────────────────────────────
@@ -707,7 +747,11 @@ echo -e " ${BOLD}Активные обходы DPI:${RESET}"
 echo -e "   ${GREEN}✓${RESET} Anti-Replay Cache (защита от ТСПУ Ревизор)"
 echo -e "   ${GREEN}✓${RESET} TCPMSS=88 (фрагментация ClientHello)"
 echo -e "   ${GREEN}✓${RESET} Split-TLS (1-байт TLS Record chunking)"
-echo -e "   ${GREEN}✓${RESET} Zero-RTT Nginx (127.0.0.1:${NGINX_PORT})"
+if $NGINX_OK; then
+    echo -e "   ${GREEN}✓${RESET} Zero-RTT Nginx (127.0.0.1:${NGINX_PORT})"
+else
+    echo -e "   ${DIM}○ Zero-RTT Nginx (не настроен)${RESET}"
+fi
 if systemctl is-active --quiet "$NFQWS_SERVICE" 2>/dev/null; then
     echo -e "   ${GREEN}✓${RESET} TCP Desync nfqws (Zapret, TTL=${NFQWS_TTL})"
 else
