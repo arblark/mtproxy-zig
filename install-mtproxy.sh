@@ -196,21 +196,25 @@ if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION
 else
     ZIG_TAR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
     ZIG_URLS=(
-        "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
         "https://mirror.bazel.build/ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
-        "https://zigmirror.moe/${ZIG_VERSION}/${ZIG_TAR}"
+        "https://zig.linus.dev/download/${ZIG_VERSION}/${ZIG_TAR}"
+        "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
     )
     cd /tmp
+    rm -f "$ZIG_TAR" 2>/dev/null || true
     ZIG_OK=false
     for url in "${ZIG_URLS[@]}"; do
-        info "Скачивание Zig из $(echo "$url" | awk -F/ '{print $3}')..."
-        if curl -sSfL --connect-timeout 15 --max-time 300 --retry 2 -o "$ZIG_TAR" "$url"; then
+        mirror=$(echo "$url" | awk -F/ '{print $3}')
+        info "Скачивание Zig из ${mirror}..."
+        if curl -fSL --connect-timeout 10 --speed-limit 100000 --speed-time 15 \
+                --retry 1 --retry-delay 3 -o "$ZIG_TAR" "$url" 2>&1; then
             ZIG_OK=true
             break
         fi
-        warn "Недоступен, пробуем следующее зеркало..."
+        rm -f "$ZIG_TAR" 2>/dev/null || true
+        warn "${mirror} недоступен, пробуем следующее зеркало..."
     done
-    $ZIG_OK || fail "Не удалось скачать Zig ни с одного зеркала"
+    $ZIG_OK || fail "Не удалось скачать Zig ни с одного зеркала. Проверьте сеть: curl -I https://mirror.bazel.build"
     info "Распаковка..."
     tar xf "$ZIG_TAR"
     rm -rf /usr/local/zig
