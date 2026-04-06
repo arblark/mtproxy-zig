@@ -7,6 +7,9 @@
 #   curl -sSfL https://raw.githubusercontent.com/arblark/mtproxy-zig/main/install-mtproxy.sh | sudo bash
 #   curl -sSfL ... | sudo CF_TOKEN=xxx CF_ZONE=yyy bash
 #
+# With AmneziaWG tunnel (for regions where Telegram is blocked):
+#   curl -sSfL ... | sudo AWG_CONF=/path/to/awg.conf bash
+#
 # Supported: Ubuntu 20.04+, Debian 11+  |  x86_64, aarch64
 
 set -euo pipefail
@@ -22,6 +25,7 @@ NUM_USERS="${NUM_USERS:-1}"
 NFQUEUE_NUM=200
 NFQWS_TTL="${NFQWS_TTL:-6}"
 NGINX_PORT=8443
+AWG_CONF="${AWG_CONF:-}"
 
 # ── Colors ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
@@ -526,12 +530,123 @@ else
     info "IPv6 hopping пропущен (CF_TOKEN / CF_ZONE не заданы)"
 fi
 
+# ── AmneziaWG Tunnel (blocked regions) ─────────────────────
+TUNNEL_MODE=false
+
+if [[ -n "${AWG_CONF:-}" ]]; then
+    section "AmneziaWG Tunnel"
+
+    [[ -f "$AWG_CONF" ]] || fail "AWG_CONF файл не найден: $AWG_CONF"
+
+    info "Установка AmneziaWG..."
+    if command -v awg &>/dev/null; then
+        ok "AmneziaWG уже установлен"
+    else
+        apt-get install -y software-properties-common > /dev/null 2>&1 || true
+        add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y amneziawg-tools 2>&1 | tail -3 || fail "Не удалось установить amneziawg-tools"
+        ok "AmneziaWG установлен"
+    fi
+
+    info "Настройка туннеля..."
+    if [[ -f "$TMPBUILD/deploy/setup_tunnel.sh" ]]; then
+        cp "$TMPBUILD/deploy/setup_tunnel.sh" "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/setup_tunnel.sh"
+    fi
+
+    AWG_CONF_DIR="/etc/amnezia/amneziawg"
+    mkdir -p "$AWG_CONF_DIR"
+    cp "$AWG_CONF" "$AWG_CONF_DIR/awg0.conf"
+    chmod 600 "$AWG_CONF_DIR/awg0.conf"
+
+    NS_NAME="tg_proxy_ns"
+    NETNS_SCRIPT="/usr/local/bin/setup_netns.sh"
+
+    cat > "$NETNS_SCRIPT" << 'NETNS_EOF'
+#!/bin/bash
+set -e
+NS_NAME="tg_proxy_ns"
+MAIN_IF=$(ip route get 8.8.8.8 | awk '{printf $5}')
+
+ip netns del $NS_NAME 2>/dev/null || true
+ip link del veth_main 2>/dev/null || true
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+ip netns add $NS_NAME
+
+mkdir -p /etc/netns/$NS_NAME
+cat > /etc/netns/$NS_NAME/resolv.conf << EOF2
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF2
+
+ip link add veth_main type veth peer name veth_ns
+ip link set veth_ns netns $NS_NAME
+ip addr add 10.200.200.1/24 dev veth_main
+ip link set veth_main up
+
+ip netns exec $NS_NAME ip addr add 10.200.200.2/24 dev veth_ns
+ip netns exec $NS_NAME ip link set veth_ns up
+ip netns exec $NS_NAME ip link set lo up
+ip netns exec $NS_NAME ip route add default via 10.200.200.1
+
+ip netns exec $NS_NAME awg-quick up /etc/amnezia/amneziawg/awg0.conf
+
+ip netns exec $NS_NAME ip rule add from 10.200.200.2 table 100 priority 100
+ip netns exec $NS_NAME ip route add default via 10.200.200.1 table 100
+
+iptables -t nat -D PREROUTING -i $MAIN_IF -p tcp --dport 443 -j DNAT --to-destination 10.200.200.2:443 2>/dev/null || true
+iptables -t nat -A PREROUTING -i $MAIN_IF -p tcp --dport 443 -j DNAT --to-destination 10.200.200.2:443
+iptables -t nat -D POSTROUTING -s 10.200.200.0/24 -o $MAIN_IF -j MASQUERADE 2>/dev/null || true
+iptables -t nat -A POSTROUTING -s 10.200.200.0/24 -o $MAIN_IF -j MASQUERADE
+iptables -D FORWARD -i $MAIN_IF -o veth_main -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i $MAIN_IF -o veth_main -j ACCEPT
+iptables -D FORWARD -i veth_main -o $MAIN_IF -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i veth_main -o $MAIN_IF -j ACCEPT
+NETNS_EOF
+    chmod +x "$NETNS_SCRIPT"
+    ok "Скрипт namespace создан"
+
+    # Switch config to direct mode (middleproxy needs per-IP registration)
+    if grep -q 'use_middle_proxy\s*=\s*true' "$INSTALL_DIR/config.toml" 2>/dev/null; then
+        sed -i 's/use_middle_proxy\s*=\s*true/use_middle_proxy = false/' "$INSTALL_DIR/config.toml"
+        sed -i '/^\s*tag\s*=/d' "$INSTALL_DIR/config.toml"
+        ok "Переключено в direct mode"
+    fi
+
+    # Patch systemd service for tunnel mode
+    cat > /etc/systemd/system/${SERVICE_NAME}.service << 'SVC_EOF'
+[Unit]
+Description=MTProto Proxy (Zig) via AmneziaWG Tunnel
+Documentation=https://github.com/sleep3r/mtproto.zig
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/setup_netns.sh
+ExecStart=/sbin/ip netns exec tg_proxy_ns /opt/mtproto-proxy/mtproto-proxy /opt/mtproto-proxy/config.toml
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+LimitNOFILE=131582
+TasksMax=65535
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+    systemctl daemon-reload
+    ok "Systemd сервис настроен для tunnel mode"
+    TUNNEL_MODE=true
+fi
+
 # ── Start proxy ─────────────────────────────────────────────
 section "Запуск MTProto proxy"
 
 chown -R mtproto:mtproto "$INSTALL_DIR"
 systemctl restart "$SERVICE_NAME"
-sleep 2
+sleep 3
 
 # ── Health checks ───────────────────────────────────────────
 section "Проверка здоровья"
@@ -565,6 +680,22 @@ MASK_PORT=$(awk '/^\s*\[censorship\]/{f=1;next} /^\s*\[/{f=0} f && /^\s*mask_por
     "$INSTALL_DIR/config.toml" 2>/dev/null)
 if [[ -n "$MASK_PORT" ]] && curl -sk --max-time 3 "https://127.0.0.1:${MASK_PORT}/" > /dev/null 2>&1; then
     ok "Маскировка: 127.0.0.1:${MASK_PORT} отвечает"
+fi
+
+# Tunnel DC connectivity check
+if $TUNNEL_MODE; then
+    info "Проверка доступности Telegram DC через туннель..."
+    DC_OK=true
+    for dc_ip in 149.154.175.50 149.154.167.50 149.154.175.100 149.154.167.91 91.108.56.100; do
+        if ip netns exec tg_proxy_ns nc -zw3 "$dc_ip" 443 2>/dev/null; then
+            ok "DC $dc_ip доступен"
+        else
+            warn "DC $dc_ip НЕ доступен"
+            DC_OK=false
+            HEALTH_OK=false
+        fi
+    done
+    $DC_OK && ok "Все Telegram DC доступны через AWG туннель" || warn "Некоторые DC недоступны — проверьте AWG конфиг"
 fi
 
 $HEALTH_OK && ok "Все проверки пройдены!" || warn "Есть проблемы — journalctl -u $SERVICE_NAME -f"
@@ -610,12 +741,32 @@ case "${1:-}" in
         echo "Обновление из GitHub Releases..."
         bash /opt/mtproto-proxy/update.sh "${2:-}"
         ;;
+    tunnel)
+        if [[ -z "${2:-}" ]]; then
+            echo "Использование: mtproxy tunnel /path/to/awg.conf"
+            echo "Настраивает AmneziaWG туннель для регионов с блокировкой Telegram."
+            exit 1
+        fi
+        bash /opt/mtproto-proxy/setup_tunnel.sh "$2"
+        ;;
     uninstall)
         echo "Удаление MTProto proxy..."
         systemctl stop mtproto-proxy nfqws-mtproto 2>/dev/null || true
         systemctl disable mtproto-proxy nfqws-mtproto 2>/dev/null || true
         rm -f /etc/systemd/system/mtproto-proxy.service /etc/systemd/system/nfqws-mtproto.service
         rm -f /etc/cron.d/mtproto-ipv6
+        # Cleanup AmneziaWG tunnel
+        ip netns exec tg_proxy_ns awg-quick down /etc/amnezia/amneziawg/awg0.conf 2>/dev/null || true
+        ip netns del tg_proxy_ns 2>/dev/null || true
+        ip link del veth_main 2>/dev/null || true
+        rm -f /usr/local/bin/setup_netns.sh
+        rm -rf /etc/amnezia/amneziawg 2>/dev/null || true
+        rm -rf /etc/netns/tg_proxy_ns 2>/dev/null || true
+        MAIN_IF=$(ip route get 8.8.8.8 2>/dev/null | awk '{printf $5}')
+        iptables -t nat -D PREROUTING -i "$MAIN_IF" -p tcp --dport 443 -j DNAT --to-destination 10.200.200.2:443 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -s 10.200.200.0/24 -o "$MAIN_IF" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$MAIN_IF" -o veth_main -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i veth_main -o "$MAIN_IF" -j ACCEPT 2>/dev/null || true
         systemctl daemon-reload
         iptables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 88 2>/dev/null || true
         iptables -t mangle -D OUTPUT -p tcp --sport 443 -j NFQUEUE --queue-num 200 2>/dev/null || true
@@ -628,7 +779,7 @@ case "${1:-}" in
         echo "Удалено."
         ;;
     *)
-        echo "mtproxy {status|restart|logs|link|add-user [имя]|update [vX.Y.Z]|uninstall}"
+        echo "mtproxy {status|restart|logs|link|add-user [имя]|update [vX.Y.Z]|tunnel <awg.conf>|uninstall}"
         ;;
 esac
 MANAGE_EOF
@@ -675,6 +826,16 @@ if [[ -f /etc/cron.d/mtproto-ipv6 ]]; then
 else
     echo -e "   ${DIM}○ IPv6 hopping (задайте CF_TOKEN + CF_ZONE)${RESET}"
 fi
+if $TUNNEL_MODE; then
+    echo ""
+    echo -e " ${BOLD}AmneziaWG Tunnel:${RESET}"
+    echo -e "   ${GREEN}✓${RESET} Прокси работает в изолированном network namespace"
+    echo -e "   ${GREEN}✓${RESET} AWG туннель активен (host-сеть не затронута)"
+    echo -e "   ${GREEN}✓${RESET} Direct mode (регистрация middleproxy не нужна)"
+    echo -e "   ${GREEN}✓${RESET} SSH и остальные сервисы не затронуты"
+    echo ""
+    echo -e "   ${DIM}Туннель:${RESET} ip netns exec tg_proxy_ns awg show"
+fi
 
 echo ""
 echo -e " ${BOLD}Управление:${RESET}"
@@ -685,6 +846,7 @@ echo -e "   ${DIM}mtproxy link${RESET}               — ссылки подкл
 echo -e "   ${DIM}mtproxy add-user имя${RESET}       — добавить пользователя"
 echo -e "   ${DIM}mtproxy update${RESET}             — обновить из GitHub Releases"
 echo -e "   ${DIM}mtproxy update v0.7.0${RESET}      — конкретная версия"
+echo -e "   ${DIM}mtproxy tunnel awg.conf${RESET}    — AWG туннель (заблокированные регионы)"
 echo -e "   ${DIM}mtproxy uninstall${RESET}          — удаление"
 echo ""
 echo -e " ${BOLD}Конфиг:${RESET}  ${DIM}${INSTALL_DIR}/config.toml${RESET}"
