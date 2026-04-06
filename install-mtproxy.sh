@@ -194,11 +194,23 @@ section "Установка Zig ${ZIG_VERSION}"
 if command -v zig &>/dev/null && zig version 2>/dev/null | grep -q "$ZIG_VERSION"; then
     ok "Zig $ZIG_VERSION уже установлен"
 else
-    info "Скачивание Zig ${ZIG_VERSION} (${ZIG_ARCH})..."
     ZIG_TAR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz"
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
+    ZIG_URLS=(
+        "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
+        "https://mirror.bazel.build/ziglang.org/download/${ZIG_VERSION}/${ZIG_TAR}"
+        "https://zigmirror.moe/${ZIG_VERSION}/${ZIG_TAR}"
+    )
     cd /tmp
-    curl -sSfL -o "$ZIG_TAR" "$ZIG_URL" || fail "Не удалось скачать Zig"
+    ZIG_OK=false
+    for url in "${ZIG_URLS[@]}"; do
+        info "Скачивание Zig из $(echo "$url" | awk -F/ '{print $3}')..."
+        if curl -sSfL --connect-timeout 15 --max-time 300 --retry 2 -o "$ZIG_TAR" "$url"; then
+            ZIG_OK=true
+            break
+        fi
+        warn "Недоступен, пробуем следующее зеркало..."
+    done
+    $ZIG_OK || fail "Не удалось скачать Zig ни с одного зеркала"
     info "Распаковка..."
     tar xf "$ZIG_TAR"
     rm -rf /usr/local/zig
@@ -216,7 +228,12 @@ cleanup() { rm -rf "$TMPBUILD"; log_to_file "Cleanup done"; }
 trap cleanup EXIT
 
 info "Клонирование репозитория..."
-git clone --depth 1 "$REPO_URL" "$TMPBUILD" || fail "Не удалось клонировать"
+for _try in 1 2 3; do
+    git clone --depth 1 "$REPO_URL" "$TMPBUILD" && break
+    warn "Попытка ${_try}/3 не удалась, повтор через 5с..."
+    rm -rf "$TMPBUILD"; TMPBUILD=$(mktemp -d); sleep 5
+done
+[[ -d "$TMPBUILD/src" ]] || fail "Не удалось клонировать после 3 попыток"
 cd "$TMPBUILD"
 
 info "Сборка (ReleaseFast)... ~1-3 мин."
