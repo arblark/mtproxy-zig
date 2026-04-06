@@ -84,6 +84,13 @@ ok "CPU: $(nproc) ядер"
 section "Установка системных зависимостей"
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+# Disable needrestart interactive prompts that break piped installs
+if [[ -d /etc/needrestart/conf.d ]]; then
+    echo '$nrconf{restart} = "a";' > /etc/needrestart/conf.d/99-autorestart.conf
+fi
 
 info "Подготовка пакетного менеджера..."
 
@@ -114,8 +121,8 @@ if [[ -n "$BROKEN_PKGS" ]]; then
     rm -f /boot/initrd.img-*.old 2>/dev/null || true
 fi
 
-dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -3 || true
-apt-get -f install -y 2>&1 | tail -3 || true
+dpkg --configure -a --force-confdef --force-confold > /dev/null 2>&1 || true
+apt-get -f install -y > /dev/null 2>&1 || true
 ok "Пакетный менеджер готов"
 
 fix_dpkg() {
@@ -127,8 +134,8 @@ fix_dpkg() {
     for pkg in $broken; do
         dpkg --remove --force-remove-reinstreq "$pkg" 2>/dev/null || true
     done
-    dpkg --configure -a --force-confdef --force-confold 2>&1 | tail -3 || true
-    apt-get -f install -y 2>&1 | tail -3 || true
+    dpkg --configure -a --force-confdef --force-confold > /dev/null 2>&1 || true
+    apt-get -f install -y > /dev/null 2>&1 || true
 }
 
 wait_for_apt() {
@@ -146,16 +153,17 @@ wait_for_apt() {
 
 # ── Install base packages ───────────────────────────────────
 info "Обновление пакетных списков..."
-apt-get update -qq 2>&1 | tail -1 || true
+apt-get update -qq > /dev/null 2>&1 || true
 
 info "Установка пакетов..."
 BASE_PACKAGES=(git curl wget openssl jq tar xz-utils build-essential iptables
     libnetfilter-queue-dev libcap-dev libmnl-dev zlib1g-dev)
 
-if ! apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -5; then
+if ! apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
+    "${BASE_PACKAGES[@]}" > /dev/null 2>&1; then
     warn "Ошибка — пробуем починить dpkg..."
     fix_dpkg
-    apt-get install -y "${BASE_PACKAGES[@]}" 2>&1 | tail -3 || true
+    apt-get install -y "${BASE_PACKAGES[@]}" > /dev/null 2>&1 || true
 fi
 
 # Nginx: prevent default IPv6 config from breaking install on IPv4-only hosts
@@ -164,10 +172,10 @@ mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
 echo "# Empty default" > /etc/nginx/sites-available/default
 ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true
 systemctl mask nginx.service 2>/dev/null || true
-apt-get install -y nginx 2>&1 | tail -3 || true
+apt-get install -y nginx > /dev/null 2>&1 || true
 systemctl unmask nginx.service 2>/dev/null || true
 
-apt-get install -y certbot python3-certbot-nginx 2>/dev/null || true
+apt-get install -y certbot python3-certbot-nginx > /dev/null 2>&1 || true
 
 if ! command -v xxd &>/dev/null; then
     apt-get install -y xxd 2>/dev/null || apt-get install -y vim-common 2>/dev/null || true
@@ -390,7 +398,7 @@ NGINX_OK=false
 if ! command -v nginx &>/dev/null; then
     warn "Nginx не установлен — пробуем ещё раз..."
     wait_for_apt
-    apt-get install -y nginx 2>&1 | tail -3 || true
+    apt-get install -y nginx > /dev/null 2>&1 || true
 fi
 
 if command -v nginx &>/dev/null; then
@@ -458,7 +466,7 @@ else
         info "Сборка nfqws..."
         cd "${ZAPRET_DIR}/nfq"
         make clean > /dev/null 2>&1 || true
-        make 2>&1 | tail -3 || true
+        make > /dev/null 2>&1 || true
         [[ -x nfqws ]] && ok "nfqws собран" || warn "Сборка nfqws не удалась"
     else
         warn "Не удалось клонировать zapret"
@@ -545,7 +553,7 @@ if [[ -n "${AWG_CONF:-}" ]]; then
         apt-get install -y software-properties-common > /dev/null 2>&1 || true
         add-apt-repository -y ppa:amnezia/ppa 2>/dev/null || true
         apt-get update -qq 2>/dev/null || true
-        apt-get install -y amneziawg-tools 2>&1 | tail -3 || fail "Не удалось установить amneziawg-tools"
+        apt-get install -y amneziawg-tools > /dev/null 2>&1 || fail "Не удалось установить amneziawg-tools"
         ok "AmneziaWG установлен"
     fi
 
